@@ -1,9 +1,9 @@
-# OpenAI-Compatible Server Latency Benchmark
+# OpenAI-Compatible Server Latency Benchmark (3 Replicas, Single GPU)
 
 **Date:** 2026-03-17
 **Server:** `examples/openai_server.py`
 **Model:** Qwen/Qwen3-TTS-12Hz-1.7B-Base
-**Replicas:** 3
+**Replicas:** 3 (all on the same GPU)
 **Text length:** ~N(200, 20) chars
 **Requests:** 20 per tier (+ 4 warmup for sequential, + 2 warmup per RPS tier)
 
@@ -78,12 +78,23 @@ Requests are launched at the target RPS; multiple requests run in parallel acros
 - **Avg text length:** 202 chars
 - **Avg audio size:** 511.7 KB
 
+## Concurrency Isolation Test
+
+3 identical requests fired simultaneously vs sequentially (same texts, ~200 chars each):
+
+| Mode           | Wall clock | Per-request avg |
+|----------------|------------|-----------------|
+| 3 sequential   | 10.2s      | ~3.4s           |
+| 3 concurrent   | 9.4s       | ~9.3s           |
+| **Speedup**    | **1.08x**  |                 |
+
+Each concurrent request takes ~3x longer individually due to GPU contention, yielding only ~8% wall-clock improvement.
+
 ## Notes
 
-- The server runs 3 replicas of the model via `--replicas 3`, enabling up to 3 concurrent inferences.
-- Sequential performance is identical to 1-replica: ~332 ms TTFB, ~3.1s total per request — only one replica is used at a time.
-- With 3 replicas and ~3.1s per request, max sustainable throughput is ~1.0 RPS (3 replicas / 3.1s).
-- At 1 RPS: the system is at its saturation point. Requests arrive at exactly the rate replicas can serve them, but any variance causes queuing. The avg total rises to ~21s as requests pile up.
-- At 2–3 RPS: requests arrive faster than the 3 replicas can process them. The queue grows linearly, leading to 28–30s avg total latency.
-- TTFB for the *first* concurrent request remains ~330 ms; the high avg TTFB at higher RPS tiers reflects queuing time, not inference latency.
-- Compared to a single replica (~0.3 RPS max), 3 replicas provide ~3x throughput improvement to ~1.0 RPS sustainable.
+- **3 replicas on a single GPU provides negligible throughput gain.** The GPU is the bottleneck: CUDA graph replays and transformer kernels from concurrent replicas contend for the same compute units. Each concurrent request takes proportionally longer, so total throughput barely improves (~1.08x) while VRAM usage triples.
+- Sequential performance: ~332 ms TTFB, ~3.1s total — identical to a 1-replica server.
+- Max sustainable throughput remains ~0.33 RPS (1 request / 3.1s), same as 1 replica.
+- At 1 RPS: requests arrive 3x faster than the server can process them. Queue depth grows linearly, leading to ~15s avg TTFB (queuing) and ~21s avg total.
+- TTFB for the *first* concurrent request remains ~330 ms; the high avg TTFB at higher RPS tiers is queuing time.
+- To achieve true N× throughput, replicas should be placed on separate GPUs.
