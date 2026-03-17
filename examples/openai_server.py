@@ -68,7 +68,7 @@ tts_model = None
 voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
-_model_lock = threading.Lock()  # prevent concurrent GPU inference
+_model_lock = asyncio.Lock()  # prevent concurrent GPU inference
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -173,12 +173,12 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
     Run generate_voice_clone_streaming in a background thread and yield
     raw PCM bytes for each chunk as they arrive.
     """
-    q: queue.Queue = queue.Queue()
-    _DONE = object()
+    async with _model_lock:
+        q: queue.Queue = queue.Queue()
+        _DONE = object()
 
-    def producer():
-        try:
-            with _model_lock:
+        def producer():
+            try:
                 for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
                     text=text,
                     language=voice_cfg.get("language", "Auto"),
@@ -188,22 +188,22 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
                     non_streaming_mode=False,
                 ):
                     q.put(chunk)
-        except Exception as exc:
-            q.put(exc)
-        finally:
-            q.put(_DONE)
+            except Exception as exc:
+                q.put(exc)
+            finally:
+                q.put(_DONE)
 
-    thread = threading.Thread(target=producer, daemon=True)
-    thread.start()
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
 
-    loop = asyncio.get_event_loop()
-    while True:
-        item = await loop.run_in_executor(None, q.get)
-        if item is _DONE:
-            break
-        if isinstance(item, Exception):
-            raise item
-        yield _to_pcm16(item)
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield _to_pcm16(item)
 
 
 # ---------------------------------------------------------------------------
@@ -240,18 +240,18 @@ async def create_speech(req: SpeechRequest):
 
     # --- MP3: generate all audio, then encode (non-streaming) ---
     if fmt == "mp3":
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _generate():
-            with _model_lock:
-                return tts_model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                )
+            return tts_model.generate_voice_clone(
+                text=req.input,
+                language=voice_cfg.get("language", "Auto"),
+                ref_audio=voice_cfg["ref_audio"],
+                ref_text=voice_cfg.get("ref_text", ""),
+            )
 
-        audio_arrays, sr = await loop.run_in_executor(None, _generate)
+        async with _model_lock:
+            audio_arrays, sr = await loop.run_in_executor(None, _generate)
         audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
         return Response(content=_to_mp3_bytes(audio, sr), media_type=content_type)
 
@@ -318,6 +318,9 @@ def main():
     if args.voices:
         with open(args.voices) as f:
             voices = json.load(f)
+        if not voices:
+            print("ERROR: voices config is empty", file=sys.stderr)
+            sys.exit(1)
         default_voice = next(iter(voices))
         logger.info("Loaded %d voice(s) from %s", len(voices), args.voices)
     elif args.ref_audio:
