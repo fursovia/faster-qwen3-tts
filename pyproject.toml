@@ -39,6 +39,7 @@ demo = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.7",
+    "gunicorn>=21.2.0",
 ]
 
 [project.scripts]
