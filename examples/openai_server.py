@@ -1,50 +1,26 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible TTS API server for faster-qwen3-tts.
+OpenAI-compatible TTS API server for faster-qwen3-tts (single model per worker).
 
-Exposes POST /v1/audio/speech compatible with OpenAI's TTS API, enabling
-integration with OpenWebUI, llama-swap, and other OpenAI-compatible clients.
+Start it with the Typer CLI below. The CLI always launches gunicorn:
 
-Usage:
     pip install "faster-qwen3-tts[demo]"
 
-    # Single model, single default voice:
-    python examples/openai_server.py \\
-        --ref-audio voice.wav --ref-text "Reference transcription" \\
+    python examples/openai_server.py \
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+        --ref-audio voice.wav \
+        --ref-text "Reference transcription" \
         --language English
 
-    # Multiple named voices from a JSON config:
-    python examples/openai_server.py --voices voices.json
+    python examples/openai_server.py --voices voices.json --workers 1
 
-    # Multiple models on one GPU:
-    python examples/openai_server.py \\
-        --model tts-1=Qwen/Qwen3-TTS-12Hz-0.6B-Base \\
-        --model tts-1-hd=Qwen/Qwen3-TTS-12Hz-1.7B-Base \\
-        --ref-audio voice.wav --ref-text "transcript" --language English
+Clients can then call:
 
-    # Load 3 replicas of the same model for concurrent requests:
-    python examples/openai_server.py \\
-        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --replicas 3 \\
-        --ref-audio voice.wav --ref-text "transcript" --language English
-
-    # Use gunicorn as the ASGI server:
-    python examples/openai_server.py \\
-        --ref-audio voice.wav --ref-text "transcript" --language English \\
-        --engine gunicorn --workers 1
-
-Voices config (voices.json):
-    {
-        "alloy": {"ref_audio": "voice.wav", "ref_text": "...", "language": "English"},
-        "echo":  {"ref_audio": "voice2.wav", "ref_text": "...", "language": "English"}
-    }
-
-API usage:
-    curl -s http://localhost:8000/v1/audio/speech \\
-        -H "Content-Type: application/json" \\
-        -d '{"model": "tts-1", "input": "Hello!", "voice": "alloy", "response_format": "wav"}' \\
+    curl -s http://localhost:8000/v1/audio/speech \
+        -H "Content-Type: application/json" \
+        -d '{"model": "tts-1", "input": "Hello!", "voice": "alloy", "response_format": "wav"}' \
         --output speech.wav
 """
-import argparse
 import asyncio
 import io
 import json
@@ -56,149 +32,135 @@ import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import numpy as np
 import torch
-import uvicorn
+import typer
+import typer.core
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+if TYPE_CHECKING:
+    from faster_qwen3_tts import FasterQwen3TTS
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Model pool – holds N replicas of a model behind an asyncio.Queue
-# ---------------------------------------------------------------------------
+DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+SERVER_CONFIG_ENV_VAR = "_FQTTS_SERVER_CONFIG"
 
 
-class ModelPool:
-    """Pool of model replicas for a single alias, enabling concurrent inference."""
-
-    def __init__(self, alias: str, replicas: list, sample_rate: int):
-        self.alias = alias
-        self.sample_rate = sample_rate
-        self.num_replicas = len(replicas)
-        # asyncio.Queue acts as a semaphore: get() blocks when all are busy
-        self._pool: asyncio.Queue = asyncio.Queue()
-        for r in replicas:
-            self._pool.put_nowait(r)
-
-    async def acquire(self):
-        """Wait for an available replica and return it."""
-        return await self._pool.get()
-
-    def release(self, model):
-        """Return a replica to the pool."""
-        self._pool.put_nowait(model)
+@dataclass(frozen=True)
+class VoiceSpec:
+    ref_audio: str
+    ref_text: str = ""
+    language: str = "Auto"
+    chunk_size: int = 6
+    xvec_only: bool = False
+    append_silence: bool = True
 
 
-# ---------------------------------------------------------------------------
-# Configuration (set by main(), or via env vars for gunicorn workers)
-# ---------------------------------------------------------------------------
-
-_server_config = {
-    "models": {},       # alias -> model_path
-    "replicas": 1,      # number of replicas per model
-    "voices": {},       # voice_name -> {ref_audio, ref_text, language, ...}
-    "default_voice": None,
-    "device": "cuda",
-}
-
-# ---------------------------------------------------------------------------
-# Global state (populated by lifespan)
-# ---------------------------------------------------------------------------
-
-model_pools: dict[str, ModelPool] = {}   # alias -> ModelPool
-default_model_alias: Optional[str] = None
-voices: dict = {}
-default_voice: Optional[str] = None
+@dataclass(frozen=True)
+class PreparedVoice:
+    spec: VoiceSpec
+    voice_clone_prompt: dict[str, Any]
 
 
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
+@dataclass
+class LoadedModel:
+    alias: str
+    model: "FasterQwen3TTS"
+    voices: dict[str, PreparedVoice]
+    sample_rate: int
+    _lock: asyncio.Lock = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> "LoadedModel":
+        await self._lock.acquire()
+        return self
+
+    def release(self) -> None:
+        self._lock.release()
 
 
-def _load_config() -> dict:
-    """Load config from env vars (gunicorn workers) or module-level _server_config."""
-    models_json = os.environ.get("_FQTTS_MODELS")
-    if models_json:
-        return {
-            "models": json.loads(models_json),
-            "replicas": int(os.environ.get("_FQTTS_REPLICAS", "1")),
-            "voices": json.loads(os.environ.get("_FQTTS_VOICES", "{}")),
-            "default_voice": os.environ.get("_FQTTS_DEFAULT_VOICE") or None,
-            "device": os.environ.get("_FQTTS_DEVICE", "cuda"),
+@dataclass(frozen=True)
+class ServerConfig:
+    model_path: str
+    voices: dict[str, VoiceSpec]
+    default_voice: str | None
+    device: str = "cuda"
+
+    def to_json(self) -> str:
+        payload = {
+            "model_path": self.model_path,
+            "voices": {name: asdict(spec) for name, spec in self.voices.items()},
+            "default_voice": self.default_voice,
+            "device": self.device,
         }
-    return _server_config
+        return json.dumps(payload)
+
+    @classmethod
+    def from_json(cls, raw_json: str) -> "ServerConfig":
+        data = json.loads(raw_json)
+        voices = {
+            name: VoiceSpec(**voice_cfg)
+            for name, voice_cfg in data["voices"].items()
+        }
+        return cls(
+            model_path=data["model_path"],
+            voices=voices,
+            default_voice=data.get("default_voice"),
+            device=data.get("device", "cuda"),
+        )
 
 
-# ---------------------------------------------------------------------------
-# Lifespan – load models on startup (works with both uvicorn and gunicorn)
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ServerRuntime:
+    config: ServerConfig
+    loaded: LoadedModel
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model_pools, default_model_alias
-    global voices, default_voice
+_in_process_config: ServerConfig | None = None
+_runtime: ServerRuntime | None = None
 
-    config = _load_config()
-    voices = config["voices"]
-    default_voice = config["default_voice"]
-    n_replicas = config["replicas"]
 
-    from faster_qwen3_tts import FasterQwen3TTS
+def _set_server_config(config: ServerConfig) -> None:
+    global _in_process_config
+    _in_process_config = config
+    os.environ[SERVER_CONFIG_ENV_VAR] = config.to_json()
 
-    for alias, path in config["models"].items():
-        replicas = []
-        for i in range(n_replicas):
-            tag = f"{alias} replica {i + 1}/{n_replicas}" if n_replicas > 1 else alias
-            logger.info("Loading %s -> %s on %s ...", tag, path, config["device"])
-            model = FasterQwen3TTS.from_pretrained(
-                path, device=config["device"], dtype=torch.bfloat16,
-            )
-            replicas.append(model)
-        pool = ModelPool(alias, replicas, replicas[0].sample_rate)
-        model_pools[alias] = pool
-        if default_model_alias is None:
-            default_model_alias = alias
 
-    total = sum(p.num_replicas for p in model_pools.values())
-    logger.info(
-        "Loaded %d model(s) with %d total replica(s): %s  (default: %s)",
-        len(model_pools), total,
-        {a: p.num_replicas for a, p in model_pools.items()},
-        default_model_alias,
+def _load_server_config() -> ServerConfig:
+    if raw_json := os.environ.get(SERVER_CONFIG_ENV_VAR):
+        return ServerConfig.from_json(raw_json)
+    if _in_process_config is not None:
+        return _in_process_config
+    raise RuntimeError(
+        f"{SERVER_CONFIG_ENV_VAR} is not set. Start the server via "
+        "'python examples/openai_server.py ...' or export the config before "
+        "running gunicorn."
     )
-    yield
-    model_pools.clear()
 
 
-app = FastAPI(title="faster-qwen3-tts OpenAI-compatible API", lifespan=lifespan)
-
-
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
+def _runtime_or_503() -> ServerRuntime:
+    if _runtime is None:
+        raise HTTPException(status_code=503, detail="Server startup is not complete")
+    return _runtime
 
 
 class SpeechRequest(BaseModel):
     model: str = "tts-1"
     input: str
     voice: str = "alloy"
-    response_format: str = "wav"  # wav | pcm | mp3
-    speed: float = 1.0           # accepted but not yet applied
-
-
-# ---------------------------------------------------------------------------
-# Audio helpers
-# ---------------------------------------------------------------------------
+    response_format: str = "wav"  # wav | pcm
+    speed: float = 1.0            # accepted but not yet applied
 
 
 def _to_pcm16(pcm: np.ndarray) -> bytes:
@@ -207,7 +169,7 @@ def _to_pcm16(pcm: np.ndarray) -> bytes:
 
 
 def _wav_header(sample_rate: int, data_len: int = 0xFFFFFFFF) -> bytes:
-    """Build a WAV header.  Use data_len=0xFFFFFFFF for streaming (unknown size)."""
+    """Build a WAV header. Use data_len=0xFFFFFFFF for streaming."""
     n_channels = 1
     bits = 16
     byte_rate = sample_rate * n_channels * bits // 8
@@ -218,373 +180,455 @@ def _wav_header(sample_rate: int, data_len: int = 0xFFFFFFFF) -> bytes:
     buf.write(struct.pack("<I", riff_size))
     buf.write(b"WAVE")
     buf.write(b"fmt ")
-    buf.write(struct.pack("<IHHIIHH", 16, 1, n_channels, sample_rate,
-                          byte_rate, block_align, bits))
+    buf.write(
+        struct.pack(
+            "<IHHIIHH",
+            16,
+            1,
+            n_channels,
+            sample_rate,
+            byte_rate,
+            block_align,
+            bits,
+        )
+    )
     buf.write(b"data")
     buf.write(struct.pack("<I", data_len))
     return buf.getvalue()
 
 
-def _to_wav_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
-    """Convert float32 numpy array to a complete WAV file in memory."""
-    raw = _to_pcm16(pcm)
-    return _wav_header(sample_rate, len(raw)) + raw
+def _resolve_ref_audio_path(raw_path: str, base_dir: Path | None) -> str:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"Reference audio file not found: {path}")
+    return str(path)
 
 
-def _to_mp3_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
-    """Convert float32 numpy array to MP3 bytes (requires pydub + ffmpeg)."""
-    try:
-        from pydub import AudioSegment
-    except ImportError:
-        raise HTTPException(
-            status_code=400,
-            detail="response_format='mp3' requires pydub: pip install pydub",
+def _build_voice_spec(
+    voice_name: str,
+    raw_config: dict[str, Any],
+    *,
+    base_dir: Path | None,
+) -> VoiceSpec:
+    ref_audio = raw_config.get("ref_audio")
+    if not ref_audio:
+        raise ValueError(f"Voice {voice_name!r} is missing required field 'ref_audio'")
+
+    chunk_size = int(raw_config.get("chunk_size", 12))
+    if chunk_size < 1:
+        raise ValueError(f"Voice {voice_name!r} has invalid chunk_size={chunk_size}")
+
+    voice = VoiceSpec(
+        ref_audio=_resolve_ref_audio_path(str(ref_audio), base_dir),
+        ref_text=str(raw_config.get("ref_text", "")),
+        language=str(raw_config.get("language", "Auto")),
+        chunk_size=chunk_size,
+        xvec_only=bool(raw_config.get("xvec_only", False)),
+        append_silence=bool(raw_config.get("append_silence", True)),
+    )
+    if not voice.xvec_only and not voice.ref_text.strip():
+        raise ValueError(
+            f"Voice {voice_name!r} must define non-empty 'ref_text' unless xvec_only=true"
         )
-    segment = AudioSegment(
-        _to_pcm16(pcm),
-        frame_rate=sample_rate,
-        sample_width=2,
-        channels=1,
+    return voice
+
+
+def _load_voice_specs_from_file(path: Path) -> tuple[dict[str, VoiceSpec], str]:
+    with path.open() as handle:
+        raw_voices = json.load(handle)
+
+    if not isinstance(raw_voices, dict) or not raw_voices:
+        raise ValueError("Voices config must be a non-empty JSON object")
+
+    voices = {
+        voice_name: _build_voice_spec(
+            voice_name,
+            voice_cfg,
+            base_dir=path.parent,
+        )
+        for voice_name, voice_cfg in raw_voices.items()
+    }
+    return voices, next(iter(voices))
+
+
+def _build_single_voice_config(
+    ref_audio: Path,
+    ref_text: str,
+    language: str,
+    xvec_only: bool,
+) -> tuple[dict[str, VoiceSpec], str]:
+    voice = VoiceSpec(
+        ref_audio=_resolve_ref_audio_path(str(ref_audio), None),
+        ref_text=ref_text,
+        language=language,
+        xvec_only=xvec_only,
     )
-    buf = io.BytesIO()
-    segment.export(buf, format="mp3")
-    return buf.getvalue()
+    if not voice.xvec_only and not voice.ref_text.strip():
+        raise ValueError("--ref-text is required unless --xvec-only is enabled")
+    return {"default": voice}, "default"
 
 
-# ---------------------------------------------------------------------------
-# Resolution helpers
-# ---------------------------------------------------------------------------
+def _build_server_config(
+    model_path: str,
+    voices_path: Path | None,
+    ref_audio: Path | None,
+    ref_text: str,
+    language: str,
+    device: str,
+    xvec_only: bool,
+) -> ServerConfig:
+    if voices_path and ref_audio:
+        raise ValueError("Use either --voices or --ref-audio, not both")
 
+    if voices_path is not None:
+        voices, default_voice = _load_voice_specs_from_file(voices_path)
+        logger.info("Loaded %d voice(s) from %s", len(voices), voices_path)
+    elif ref_audio is not None:
+        voices, default_voice = _build_single_voice_config(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            language=language,
+            xvec_only=xvec_only,
+        )
+        logger.info("Using single voice from --ref-audio: %s", ref_audio)
+    else:
+        raise ValueError("Provide --ref-audio <file> or --voices <config.json>")
 
-def resolve_model(model_name: str) -> ModelPool:
-    """Return the ModelPool for the requested model name."""
-    if model_name in model_pools:
-        return model_pools[model_name]
-    if default_model_alias:
-        return model_pools[default_model_alias]
-    raise HTTPException(
-        status_code=400,
-        detail=f"Model {model_name!r} not loaded. Available: {list(model_pools.keys())}",
+    return ServerConfig(
+        model_path=model_path,
+        voices=voices,
+        default_voice=default_voice,
+        device=device,
     )
 
 
-def resolve_voice(voice_name: str) -> dict:
-    """Return voice config dict or fall back to default, else raise 400."""
-    if voice_name in voices:
-        return voices[voice_name]
-    if default_voice and default_voice in voices:
+def _prepare_voice_prompt(
+    model: "FasterQwen3TTS",
+    voice_name: str,
+    voice_spec: VoiceSpec,
+) -> PreparedVoice:
+    mode = "x-vector" if voice_spec.xvec_only else "ICL"
+    logger.info(
+        "Preparing voice %r from %s (%s mode)",
+        voice_name,
+        voice_spec.ref_audio,
+        mode,
+    )
+    with torch.inference_mode():
+        voice_clone_prompt, _ref_ids, _using_icl_mode = (
+            model._resolve_voice_clone_prompt_from_reference(
+                input_ids=[0],
+                ref_audio=voice_spec.ref_audio,
+                ref_text=voice_spec.ref_text,
+                xvec_only=voice_spec.xvec_only,
+                append_silence=voice_spec.append_silence,
+            )
+        )
+    return PreparedVoice(spec=voice_spec, voice_clone_prompt=voice_clone_prompt)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    del app
+    global _runtime
+
+    config = _load_server_config()
+
+    from faster_qwen3_tts import FasterQwen3TTS
+
+    logger.info("Loading model %s on %s ...", config.model_path, config.device)
+    model = FasterQwen3TTS.from_pretrained(
+        config.model_path,
+        device=config.device,
+        dtype=torch.bfloat16,
+    )
+    prepared_voices = {
+        voice_name: _prepare_voice_prompt(model, voice_name, voice_spec)
+        for voice_name, voice_spec in config.voices.items()
+    }
+    loaded = LoadedModel(
+        alias=config.model_path,
+        model=model,
+        voices=prepared_voices,
+        sample_rate=model.sample_rate,
+    )
+
+    _runtime = ServerRuntime(config=config, loaded=loaded)
+    logger.info(
+        "Model ready (%s), %d voice(s) loaded (default voice: %s)",
+        config.model_path,
+        len(config.voices),
+        config.default_voice,
+    )
+
+    try:
+        yield
+    finally:
+        _runtime = None
+
+
+app = FastAPI(title="faster-qwen3-tts OpenAI-compatible API", lifespan=lifespan)
+
+
+def _get_loaded_model() -> LoadedModel:
+    return _runtime_or_503().loaded
+
+
+def _resolve_voice_name(voice_name: str) -> str:
+    runtime = _runtime_or_503()
+    if voice_name in runtime.config.voices:
+        return voice_name
+    if runtime.config.default_voice and runtime.config.default_voice in runtime.config.voices:
         logger.warning(
             "Voice %r not configured; falling back to default voice %r",
             voice_name,
-            default_voice,
+            runtime.config.default_voice,
         )
-        return voices[default_voice]
+        return runtime.config.default_voice
     raise HTTPException(
         status_code=400,
         detail=(
             f"Voice {voice_name!r} is not configured. "
-            f"Available voices: {list(voices.keys())}"
+            f"Available voices: {list(runtime.config.voices)}"
         ),
     )
 
 
-# ---------------------------------------------------------------------------
-# Streaming helper: run sync generator in a background thread
-# ---------------------------------------------------------------------------
-
-
 async def _stream_chunks(
-    pool: ModelPool, voice_cfg: dict, text: str,
+    loaded: LoadedModel,
+    voice: PreparedVoice,
+    text: str,
 ) -> AsyncGenerator[bytes, None]:
     """
-    Acquire a replica from the pool, run generate_voice_clone_streaming in a
-    background thread, yield raw PCM bytes, then release the replica.
+    Run the sync streaming generator in a background thread and yield PCM bytes.
+
+    The thread is always joined before the model lock is released, so a
+    cancelled request cannot race with a later request on the same model instance.
     """
-    model = await pool.acquire()
+    result_queue: queue.Queue[Any] = queue.Queue()
+    done_sentinel = object()
+
+    def producer() -> None:
+        try:
+            for chunk, _sr, _timing in loaded.model.generate_voice_clone_streaming(
+                text=text,
+                language=voice.spec.language,
+                ref_text=voice.spec.ref_text,
+                chunk_size=voice.spec.chunk_size,
+                xvec_only=voice.spec.xvec_only,
+                append_silence=voice.spec.append_silence,
+                non_streaming_mode=False,
+                voice_clone_prompt=voice.voice_clone_prompt,
+            ):
+                result_queue.put(chunk)
+        except BaseException as exc:
+            result_queue.put(exc)
+        finally:
+            result_queue.put(done_sentinel)
+
+    worker = threading.Thread(
+        target=producer,
+        daemon=True,
+        name="faster-qwen3-tts-stream",
+    )
+    worker.start()
+
+    loop = asyncio.get_running_loop()
     try:
-        q: queue.Queue = queue.Queue()
-        _DONE = object()
-
-        def producer():
-            try:
-                for chunk, _sr, _timing in model.generate_voice_clone_streaming(
-                    text=text,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                    chunk_size=voice_cfg.get("chunk_size", 12),
-                    non_streaming_mode=False,
-                ):
-                    q.put(chunk)
-            except Exception as exc:
-                q.put(exc)
-            finally:
-                q.put(_DONE)
-
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
-
-        loop = asyncio.get_running_loop()
         while True:
-            item = await loop.run_in_executor(None, q.get)
-            if item is _DONE:
+            item = await loop.run_in_executor(None, result_queue.get)
+            if item is done_sentinel:
                 break
-            if isinstance(item, Exception):
+            if isinstance(item, BaseException):
                 raise item
             yield _to_pcm16(item)
     finally:
-        pool.release(model)
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+        await asyncio.shield(loop.run_in_executor(None, worker.join))
 
 
 @app.get("/health")
 async def health():
+    runtime = _runtime_or_503()
     return {
         "status": "ok",
-        "models_loaded": {
-            alias: pool.num_replicas for alias, pool in model_pools.items()
-        },
+        "model": runtime.config.model_path,
+        "voices_loaded": list(runtime.config.voices),
+        "default_voice": runtime.config.default_voice,
     }
 
 
 @app.get("/v1/models")
 async def list_models():
     """OpenAI-compatible model listing."""
+    runtime = _runtime_or_503()
     return {
         "object": "list",
         "data": [
             {
-                "id": alias,
+                "id": runtime.loaded.alias,
                 "object": "model",
                 "owned_by": "faster-qwen3-tts",
             }
-            for alias in model_pools
         ],
     }
 
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
-    if not model_pools:
-        raise HTTPException(status_code=503, detail="No models loaded")
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="'input' text is empty")
 
-    pool = resolve_model(req.model)
-    voice_cfg = resolve_voice(req.voice)
     fmt = req.response_format.lower()
-
-    _CONTENT_TYPES = {
+    content_types = {
         "wav": "audio/wav",
         "pcm": "audio/pcm",
-        "mp3": "audio/mpeg",
     }
-    if fmt not in _CONTENT_TYPES:
+    if fmt not in content_types:
         raise HTTPException(
             status_code=400,
-            detail=f"response_format {fmt!r} not supported. Use: wav, pcm, mp3",
+            detail=f"response_format {fmt!r} not supported. Use: wav, pcm",
         )
-    content_type = _CONTENT_TYPES[fmt]
 
-    # --- MP3: generate all audio, then encode (non-streaming) ---
-    if fmt == "mp3":
-        loop = asyncio.get_running_loop()
-        model = await pool.acquire()
+    loaded = _get_loaded_model()
+    voice_name = _resolve_voice_name(req.voice)
+
+    async def audio_stream() -> AsyncGenerator[bytes, None]:
+        await loaded.acquire()
         try:
-            def _generate():
-                return model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                )
-
-            audio_arrays, sr = await loop.run_in_executor(None, _generate)
+            prepared_voice = loaded.voices[voice_name]
+            if fmt == "wav":
+                yield _wav_header(loaded.sample_rate)
+            async for raw_chunk in _stream_chunks(loaded, prepared_voice, req.input):
+                yield raw_chunk
         finally:
-            pool.release(model)
-        audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
-        return Response(content=_to_mp3_bytes(audio, sr), media_type=content_type)
+            loaded.release()
 
-    # --- WAV / PCM: stream chunks as they are generated ---
-    async def audio_stream():
-        if fmt == "wav":
-            yield _wav_header(pool.sample_rate)  # stream with unknown data length
-        async for raw_chunk in _stream_chunks(pool, voice_cfg, req.input):
-            yield raw_chunk
-
-    return StreamingResponse(audio_stream(), media_type=content_type)
+    return StreamingResponse(audio_stream(), media_type=content_types[fmt])
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
-def _parse_model_specs(raw_models: list[str]) -> dict:
-    """Parse alias=path or bare path model specs into {alias: path} dict."""
-    specs = {}
-    for spec in raw_models:
-        if "=" in spec:
-            alias, path = spec.split("=", 1)
-        else:
-            path = spec
-            # Derive alias from path: "Qwen/Qwen3-TTS-12Hz-0.6B-Base" -> "Qwen3-TTS-12Hz-0.6B-Base"
-            alias = path.rsplit("/", 1)[-1] if "/" in path else path
-        if alias in specs:
-            print(f"ERROR: duplicate model alias {alias!r}", file=sys.stderr)
-            sys.exit(1)
-        specs[alias] = path
-    return specs
-
-
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description="OpenAI-compatible TTS server for faster-qwen3-tts",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    p.add_argument(
-        "--model",
-        action="append",
-        dest="models",
-        default=None,
-        help=(
-            "Model to load (repeatable). Format: alias=path or just path. "
-            "Example: --model tts-1=Qwen/Qwen3-TTS-12Hz-0.6B-Base "
-            "--model tts-1-hd=Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-        ),
-    )
-    p.add_argument(
-        "--replicas",
-        type=int,
-        default=1,
-        help=(
-            "Number of replicas per model (default: 1). "
-            "Each replica is an independent model copy, enabling concurrent inference."
-        ),
-    )
-    p.add_argument(
-        "--voices",
-        default=os.environ.get("QWEN_TTS_VOICES"),
-        metavar="FILE",
-        help="JSON file mapping voice names to {ref_audio, ref_text, language}",
-    )
-    p.add_argument(
-        "--ref-audio",
-        default=os.environ.get("QWEN_TTS_REF_AUDIO"),
-        metavar="FILE",
-        help="Reference audio file when --voices is not used",
-    )
-    p.add_argument(
-        "--ref-text",
-        default=os.environ.get("QWEN_TTS_REF_TEXT", ""),
-        help="Transcript of --ref-audio",
-    )
-    p.add_argument(
-        "--language",
-        default=os.environ.get("QWEN_TTS_LANGUAGE", "Auto"),
-        help="Target language (English, French, Auto, ...) when --voices is not used",
-    )
-    p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
-    p.add_argument("--device", default="cuda", help="Torch device (default: cuda)")
-    p.add_argument(
-        "--engine",
-        choices=["uvicorn", "gunicorn"],
-        default="uvicorn",
-        help="ASGI server engine (default: uvicorn)",
-    )
-    p.add_argument(
+def _gunicorn_command(host: str, port: int, workers: int) -> list[str]:
+    project_root = Path(__file__).resolve().parents[1]
+    return [
+        sys.executable,
+        "-m",
+        "gunicorn",
+        "--chdir",
+        str(project_root),
+        "examples.openai_server:app",
+        "-k",
+        "uvicorn.workers.UvicornWorker",
         "--workers",
-        type=int,
-        default=1,
-        help="Number of gunicorn worker processes (default: 1). Each worker loads all models independently.",
-    )
-    return p.parse_args()
-
-
-def main():
-    args = _parse_args()
-
-    # Parse model specs
-    raw_models = args.models or [
-        os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+        str(workers),
+        "--bind",
+        f"{host}:{port}",
     ]
-    model_specs = _parse_model_specs(raw_models)
 
-    # Build voice registry
-    if args.voices:
-        with open(args.voices) as f:
-            voices_dict = json.load(f)
-        if not voices_dict:
-            print("ERROR: voices config is empty", file=sys.stderr)
-            sys.exit(1)
-        default_voice_name = next(iter(voices_dict))
-        logger.info("Loaded %d voice(s) from %s", len(voices_dict), args.voices)
-    elif args.ref_audio:
-        voices_dict = {
-            "default": {
-                "ref_audio": args.ref_audio,
-                "ref_text": args.ref_text,
-                "language": args.language,
-            }
-        }
-        default_voice_name = "default"
-        logger.info("Using single voice from --ref-audio: %s", args.ref_audio)
-    else:
-        print(
-            "ERROR: provide --ref-audio <file> or --voices <config.json>",
-            file=sys.stderr,
+
+def main(
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        envvar="QWEN_TTS_MODEL",
+        help="HuggingFace model ID or local path. Default: " + DEFAULT_MODEL_ID,
+    ),
+    voices: Optional[Path] = typer.Option(
+        None,
+        "--voices",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        envvar="QWEN_TTS_VOICES",
+        help=(
+            "JSON file mapping voice names to {ref_audio, ref_text, language, "
+            "chunk_size, xvec_only, append_silence}."
+        ),
+    ),
+    ref_audio: Optional[Path] = typer.Option(
+        None,
+        "--ref-audio",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        envvar="QWEN_TTS_REF_AUDIO",
+        help="Reference audio file when --voices is not used.",
+    ),
+    ref_text: str = typer.Option(
+        "",
+        "--ref-text",
+        envvar="QWEN_TTS_REF_TEXT",
+        help="Transcript of --ref-audio. Required for ICL mode.",
+    ),
+    language: str = typer.Option(
+        "Auto",
+        "--language",
+        envvar="QWEN_TTS_LANGUAGE",
+        help="Target language when --voices is not used.",
+    ),
+    xvec_only: bool = typer.Option(
+        False,
+        "--xvec-only",
+        help="Use only the speaker embedding for the single default voice.",
+    ),
+    host: str = typer.Option(
+        "0.0.0.0",
+        "--host",
+        help="Bind host for gunicorn.",
+    ),
+    port: int = typer.Option(
+        8000,
+        "--port",
+        min=1,
+        max=65535,
+        help="Bind port for gunicorn.",
+    ),
+    device: str = typer.Option(
+        "cuda",
+        "--device",
+        help="Torch device for model loading.",
+    ),
+    workers: int = typer.Option(
+        1,
+        "--workers",
+        min=1,
+        help=(
+            "Gunicorn worker processes. Each worker loads the model, "
+            "so values > 1 multiply VRAM usage."
+        ),
+    ),
+) -> None:
+    model_path = model or DEFAULT_MODEL_ID
+
+    try:
+        config = _build_server_config(
+            model_path=model_path,
+            voices_path=voices,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            language=language,
+            device=device,
+            xvec_only=xvec_only,
         )
-        sys.exit(1)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    logger.info(
-        "Model(s) to load: %s (%d replica(s) each)", model_specs, args.replicas,
-    )
-
-    # Store config for lifespan handler
-    _server_config.update({
-        "models": model_specs,
-        "replicas": args.replicas,
-        "voices": voices_dict,
-        "default_voice": default_voice_name,
-        "device": args.device,
-    })
-
-    if args.engine == "gunicorn":
-        # Pass config via env vars so gunicorn workers can read it
-        os.environ["_FQTTS_MODELS"] = json.dumps(model_specs)
-        os.environ["_FQTTS_REPLICAS"] = str(args.replicas)
-        os.environ["_FQTTS_VOICES"] = json.dumps(voices_dict)
-        os.environ["_FQTTS_DEFAULT_VOICE"] = default_voice_name or ""
-        os.environ["_FQTTS_DEVICE"] = args.device
-
-        server_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(server_dir)
-        env = os.environ.copy()
-        env["PYTHONPATH"] = (
-            server_dir + os.pathsep
-            + project_root + os.pathsep
-            + env.get("PYTHONPATH", "")
+    _set_server_config(config)
+    logger.info("Model to load: %s", config.model_path)
+    if workers > 1 and device.startswith("cuda"):
+        logger.warning(
+            "workers=%d will load the model in each gunicorn worker, "
+            "multiplying GPU memory usage.",
+            workers,
         )
 
-        cmd = [
-            sys.executable, "-m", "gunicorn",
-            "openai_server:app",
-            "-k", "uvicorn.workers.UvicornWorker",
-            "--workers", str(args.workers),
-            "--bind", f"{args.host}:{args.port}",
-        ]
-        logger.info("Starting gunicorn: %s", " ".join(cmd))
-        sys.exit(subprocess.call(cmd, env=env))
-    else:
-        logger.info("Server listening on http://%s:%d", args.host, args.port)
-        uvicorn.run(app, host=args.host, port=args.port)
+    cmd = _gunicorn_command(host=host, port=port, workers=workers)
+    logger.info("Starting gunicorn: %s", " ".join(cmd))
+    raise typer.Exit(subprocess.call(cmd, env=os.environ.copy()))
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
